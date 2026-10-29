@@ -1,0 +1,264 @@
+1. Configuration File: /etc/diskguardian/diskguardian.conf
+Ini, TOML
+# /etc/diskguardian/diskguardian.conf
+# DiskGuardian System Configuration
+
+# Usage percentage threshold to trigger volume expansion (Integer 1-99)
+EXPAND_THRESHOLD_PERCENT=85
+
+# Amount of space to add during auto-expansion (LVM syntax, e.g., 5G, 10G)
+EXPAND_INCREMENT="5G"
+
+# Minimum free space required in Volume Group to attempt expansion (in GB)
+VG_MIN_FREE_GB=6
+
+# Prometheus Node Exporter Textfile Collector path
+METRICS_DIR="/var/lib/node_exporter/textfile_collector"
+METRICS_FILE="${METRICS_DIR}/diskguardian.prom"
+
+# Optional webhook for critical notifications (Slack, Discord, Teams)
+# Leave blank to log strictly to systemd journal
+WEBHOOK_URL=""
+
+# Log cleanup target directories (files older than RETENTION_DAYS will be purged)
+LOG_CLEANUP_DIR="/var/log"
+RETENTION_DAYS=14
+2. Core Automation Engine: /usr/local/bin/diskguardian.sh
+Make executable after creating: sudo chmod 750 /usr/local/bin/diskguardian.sh
+
+Bash
+#!/usr/bin/env bash
+#
+# DiskGuardian: Autonomous Linux Storage & Volume Lifecycle Engine
+#
+set -euo pipefail
+
+CONF_FILE="/etc/diskguardian/diskguardian.conf"
+
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/etc/diskguardian/diskguardian.conf
+    source "$CONF_FILE"
+else
+    echo "Config file not found at $CONF_FILE. Using internal defaults."
+    EXPAND_THRESHOLD_PERCENT=85
+    EXPAND_INCREMENT="5G"
+    VG_MIN_FREE_GB=6
+    METRICS_FILE="/var/lib/node_exporter/textfile_collector/diskguardian.prom"
+    WEBHOOK_URL=""
+    LOG_CLEANUP_DIR="/var/log"
+    RETENTION_DAYS=14
+fi
+
+TMP_METRICS="${METRICS_FILE}.tmp.$$"
+HEALTH_STATUS=1 # 1 = Healthy, 0 = Degraded
+
+log_info() {
+    logger -t DiskGuardian -p user.info "[INFO] $1"
+    echo "[INFO] $1"
+}
+
+log_warn() {
+    logger -t DiskGuardian -p user.warning "[WARN] $1"
+    echo "[WARN] $1" >&2
+}
+
+log_error() {
+    logger -t DiskGuardian -p user.err "[ERROR] $1"
+    echo "[ERROR] $1" >&2
+    HEALTH_STATUS=0
+    send_webhook "ERROR" "$1"
+}
+
+send_webhook() {
+    local level="$1"
+    local message="$2"
+    if [[ -n "${WEBHOOK_URL:-}" ]]; then
+        local payload
+        payload=$(printf '{"text":"[DiskGuardian][%s] %s"}' "$level" "$message")
+        curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$WEBHOOK_URL" || true
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# 1. Physical Disk Health (S.M.A.R.T.)
+# -----------------------------------------------------------------------------
+check_smart_health() {
+    log_info "Auditing physical drive SMART metrics..."
+    
+    # Identify non-virtual block devices
+    local disks
+    disks=$(lsblk -d -n -o NAME,TYPE | awk '$2=="disk" && $1 !~ /^(zram|loop)/ {print $1}')
+
+    for disk in $disks; do
+        local dev="/dev/$disk"
+        
+        # Check if drive supports SMART
+        if ! smartctl -i "$dev" &>/dev/null; then
+            continue
+        fi
+
+        # Assess basic health status
+        if ! smartctl -H "$dev" | grep -Eiq "PASSED|OK"; then
+            log_error "SMART overall health assessment failed for $dev"
+        else
+            log_info "SMART assessment PASSED for $dev"
+        fi
+    done
+}
+
+# -----------------------------------------------------------------------------
+# 2. Automated Storage Reclamation
+# -----------------------------------------------------------------------------
+run_maintenance_cleanup() {
+    log_info "Starting routine storage cleanup..."
+
+    # Purge old compressed log archives
+    if [[ -d "$LOG_CLEANUP_DIR" ]]; then
+        find "$LOG_CLEANUP_DIR" -type f \( -name "*.gz" -o -name "*.old" -o -name "*.1" \) -mtime +"$RETENTION_DAYS" -delete || true
+    fi
+
+    # Clear package manager caches based on available tooling
+    if command -v apt-get &>/dev/null; then
+        apt-get clean >/dev/null 2>&1 || true
+    elif command -v dnf &>/dev/null; then
+        dnf clean all >/dev/null 2>&1 || true
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# 3. Dynamic LVM Volume Expansion
+# -----------------------------------------------------------------------------
+manage_lvm_allocations() {
+    log_info "Checking Logical Volume utilization thresholds..."
+
+    if ! command -v lvs &>/dev/null; then
+        log_warn "LVM tooling not present on this host. Skipping LVM auto-expansion."
+        return 0
+    fi
+
+    # Read mount points and identify LVM-backed filesystems
+    df -hP --type=ext4 --type=xfs | awk 'NR>1 {print $1, $5, $6}' | while read -r fs_dev pct_raw mountpoint; do
+        local usage="${pct_raw%\%}"
+
+        if [[ "$usage" -ge "$EXPAND_THRESHOLD_PERCENT" ]]; then
+            log_warn "Filesystem $mountpoint ($fs_dev) is at ${usage}% capacity (Threshold: ${EXPAND_THRESHOLD_PERCENT}%)."
+
+            # Verify if this device is managed by LVM
+            if [[ "$fs_dev" =~ ^/dev/mapper/ ]] || [[ "$fs_dev" =~ ^/dev/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+) ]]; then
+                local lv_name vg_name
+                lv_name=$(lvs --noheadings -o lv_name "$fs_dev" 2>/dev/null | tr -d ' ' || true)
+                vg_name=$(lvs --noheadings -o vg_name "$fs_dev" 2>/dev/null | tr -d ' ' || true)
+
+                if [[ -z "$vg_name" || -z "$lv_name" ]]; then
+                    continue
+                fi
+
+                # Check free capacity in Volume Group (in GiB)
+                local vg_free_gb
+                vg_free_gb=$(vgs --noheadings --units g --nosuffix -o vg_free "$vg_name" | awk '{print int($1)}')
+
+                if [[ "$vg_free_gb" -ge "$VG_MIN_FREE_GB" ]]; then
+                    log_info "Attempting online expansion of $fs_dev by $EXPAND_INCREMENT (VG $vg_name free: ${vg_free_gb}GB)..."
+                    
+                    # -r expands the underlying filesystem (ext4 or XFS) simultaneously
+                    if lvextend -r -L +"$EXPAND_INCREMENT" "$fs_dev"; then
+                        log_info "Successfully extended $fs_dev by $EXPAND_INCREMENT."
+                        send_webhook "INFO" "Auto-expanded $fs_dev ($mountpoint) by $EXPAND_INCREMENT."
+                    else
+                        log_error "Failed to execute lvextend on $fs_dev."
+                    fi
+                else
+                    log_error "Volume Group $vg_name has only ${vg_free_gb}GB free. Cannot expand $fs_dev."
+                fi
+            fi
+        fi
+    done
+}
+
+# -----------------------------------------------------------------------------
+# 4. Prometheus Metrics Export
+# -----------------------------------------------------------------------------
+export_prometheus_metrics() {
+    local target_dir
+    target_dir="$(dirname "$METRICS_FILE")"
+
+    if [[ ! -d "$target_dir" ]]; then
+        mkdir -p "$target_dir" 2>/dev/null || return 0
+    fi
+
+    cat <<EOF > "$TMP_METRICS"
+# HELP diskguardian_last_run_timestamp Unix epoch time of the last run.
+# TYPE diskguardian_last_run_timestamp gauge
+diskguardian_last_run_timestamp $(date +%s)
+# HELP diskguardian_health_status Overall disk operational status (1 = Healthy, 0 = Degraded).
+# TYPE diskguardian_health_status gauge
+diskguardian_health_status ${HEALTH_STATUS}
+EOF
+
+    mv "$TMP_METRICS" "$METRICS_FILE"
+}
+
+# -----------------------------------------------------------------------------
+# Main Execution Pipeline
+# -----------------------------------------------------------------------------
+main() {
+    log_info "DiskGuardian cycle started."
+    check_smart_health
+    run_maintenance_cleanup
+    manage_lvm_allocations
+    export_prometheus_metrics
+    log_info "DiskGuardian cycle completed successfully."
+}
+
+main "$@"
+3. Systemd Scheduling Integration
+Unit Service: /etc/systemd/system/diskguardian.service
+Ini, TOML
+[Unit]
+Description=DiskGuardian Storage Monitor and Auto-Manager
+Documentation=man:lvm(8) man:smartctl(8)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/diskguardian.sh
+StandardOutput=journal
+StandardError=journal
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
+Unit Timer: /etc/systemd/system/diskguardian.timer
+Ini, TOML
+[Unit]
+Description=Execute DiskGuardian every 15 minutes
+PartOf=diskguardian.service
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+4. Setup & Deployment Commands
+Run the following commands on the target host as root:
+
+Bash
+# 1. Install prerequisites (Debian/Ubuntu example)
+apt-get update && apt-get install -y smartmontools lvm2 curl util-linux
+
+# 2. Set directory and file permissions
+mkdir -p /etc/diskguardian /var/lib/node_exporter/textfile_collector
+chmod 755 /etc/diskguardian
+chmod 750 /usr/local/bin/diskguardian.sh
+
+# 3. Reload systemd, register, and start the timer
+systemctl daemon-reload
+systemctl enable --now diskguardian.timer
+
+# 4. Verify schedule and manually test execution
+systemctl list-timers diskguardian.timer
+systemctl start diskguardian.service
+journalctl -u diskguardian.service -n 50 --no-pager
